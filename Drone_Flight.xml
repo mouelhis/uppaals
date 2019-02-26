@@ -1,0 +1,1253 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE nta PUBLIC '-//Uppaal Team//DTD Flat System 1.1//EN' 'http://www.it.uu.se/research/group/darts/uppaal/flat-1_2.dtd'>
+<nta>
+	<declaration>/**********************************/
+/* Constants and Type definitions */
+/**********************************/
+const int MAX_DRONES             := 3; 
+const int MAX_DRONE_ID           := 5;
+const int MAX_GCS_METHOD_CALLS   := 3;
+const int MAX_METHOD_PARAMETERS  := 2;
+const int MAX_ENTRIES            := MAX_DRONE_ID+1+2*MAX_GCS_METHOD_CALLS;
+const int CHANNEL_CALLS_OFFSET   := MAX_DRONE_ID+1; 
+
+//DEFAULT constants   
+const int MESSAGE_KEY_DEFAULT    := 0;
+const int EXCHANGER_DEFAULT      := -1;
+const int CALL_ID_DEFAULT        := -1;
+const int PARAMETER_DEFAULT      := -1;
+const int DRONE_ID_DEFAULT       := -1;
+
+//Remote method, return and exception action identifiers, to be passed to the network when a remote call is made ...
+const int MTH_Fly_To                := 7;
+const int RET_Next_Position         := 8;
+const int EXC_Unknown_Position      := 9;
+const int MTH_Which_Supply          := 13;
+const int RET_Medical_Supply        := 14; 
+
+
+
+/**************************************/
+/* Network/Message packets attributes */
+/**************************************/
+const int MAX_NETWORK_TRACKS          := 3;
+const int MAX_LATENCY                 := 30; 
+const int MIN_LATENCY                 := 5; 
+const int MAX_IDLE                    := 20;
+const int TRACK_0                     := 0;
+const int TRACK_1                     := 1;
+const int TRACK_2                     := 2;
+const int TRACK_DEFAULT               := -1; 
+
+
+typedef struct
+{ 
+  bool present;
+  bool fault;
+  int  key;
+  int  sender;
+  int  receiver;
+} Message;
+
+typedef struct
+{
+  bool locked;
+  int value;
+} Shared_Integer;
+
+//Other constants
+
+const Message DEFAULT_MESSAGE := { false, false,
+                                   MESSAGE_KEY_DEFAULT, 
+                                   EXCHANGER_DEFAULT, 
+                                   EXCHANGER_DEFAULT };
+
+
+// Network is push-to-talk ...
+// The network is modeled by a channel layers of size MAX_NETWORK_LAYERS ...
+// Each track corresponds to messages transiting from a sender vehicle to receiver one ... 
+
+Message channelized_data[MAX_NETWORK_TRACKS] = 
+{
+  DEFAULT_MESSAGE, 
+  DEFAULT_MESSAGE,
+  DEFAULT_MESSAGE
+};
+
+
+int available_tracks := MAX_NETWORK_TRACKS; 
+
+//channels
+chan Hack[MAX_NETWORK_TRACKS];
+chan Inputs[MAX_NETWORK_TRACKS];
+broadcast chan Outputs[MAX_NETWORK_TRACKS];
+
+int access()
+{
+    if (available_tracks &gt; 0)
+    {
+        for (i : int[0,MAX_NETWORK_TRACKS-1])
+        {
+            if (!channelized_data[i].present) return i;     
+        }
+    }
+    return TRACK_DEFAULT;
+}
+
+/**********************************/
+/* Message queues                 */
+/**********************************/
+const int MAX_QUEUE_SIZE := 3;
+
+
+
+typedef struct
+{ 
+  bool validity;
+  Message buffer[MAX_QUEUE_SIZE];
+  int read;
+  int write;
+} Queue; 
+
+
+
+const Queue NEW_TRACK_QUEUE := { true, { DEFAULT_MESSAGE, DEFAULT_MESSAGE, DEFAULT_MESSAGE }, 0, 0 };
+//const Queue DEFAULT_TRACK_QUEUE := { false, { DEFAULT_MESSAGE, DEFAULT_MESSAGE, DEFAULT_MESSAGE }, 0, 0 };
+
+void enqueue(Queue &amp;q, Message item)
+{
+    if (q.read != (q.write+1)%MAX_QUEUE_SIZE)
+    { 
+        q.buffer[q.write] = item;
+        q.write = (q.write+1)%MAX_QUEUE_SIZE;
+    }
+}
+
+Message dequeue(Queue &amp;q)
+{    
+    Message item;
+    if (q.write != q.read) item := q.buffer[q.read];
+    q.buffer[q.read] := DEFAULT_MESSAGE;
+    q.read := (q.read+1)%MAX_QUEUE_SIZE;  
+    return item;
+}
+
+/**********************************/
+/* GCS/Drone related attributes   */
+/**********************************/
+//Acronyms : 
+// cds : connected drones
+// db : drone base
+// nb : number
+// p : parameter
+// did : drone identifier
+// init : initialized
+// mw : middleware
+// UPE : Unknown Position Exception
+
+
+
+
+const int GCS_ID                  := 6;
+const bool ACTIVE                 := true;
+const bool INACTIVE               := false;
+const int MAX_WAIT                := MAX_LATENCY + 20;
+
+const int ENTRIES_FTC_OFFSET     := MAX_DRONE_ID+1;
+const int ENTRIES_WSC_OFFSET     := MAX_DRONE_ID+1+MAX_GCS_METHOD_CALLS;
+
+Shared_Integer gcs_mc := { false, 0 };
+
+
+
+int gcs_ftc_did[MAX_GCS_METHOD_CALLS] := { DRONE_ID_DEFAULT, 
+                                           DRONE_ID_DEFAULT, 
+                                           DRONE_ID_DEFAULT };
+
+
+
+
+int gcs_wsc_did[MAX_GCS_METHOD_CALLS] := { DRONE_ID_DEFAULT, 
+                                           DRONE_ID_DEFAULT, 
+                                           DRONE_ID_DEFAULT };
+
+int new_call(int &amp;did[MAX_GCS_METHOD_CALLS]){
+    
+    for (i : int[0,MAX_GCS_METHOD_CALLS-1])
+    {
+        if (did[i] == DRONE_ID_DEFAULT) return i;
+    }
+    return CALL_ID_DEFAULT;
+}
+
+
+bool from_mw[MAX_ENTRIES] := { false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false };
+
+bool to_mw[MAX_ENTRIES]   := { false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false,
+                               false };
+
+
+
+
+/***************************/
+/* Method channels         */
+/***************************/
+//Remote Method, return and exception channels
+chan Fly_To[MAX_DRONE_ID+1+MAX_GCS_METHOD_CALLS],
+     Next_Position[MAX_DRONE_ID+1+MAX_GCS_METHOD_CALLS],
+     Unknown_Position[MAX_DRONE_ID+1+MAX_GCS_METHOD_CALLS];
+
+chan Which_Supply[MAX_DRONE_ID+1+MAX_GCS_METHOD_CALLS],
+     Medical_Supply[MAX_DRONE_ID+1+MAX_GCS_METHOD_CALLS];
+
+chan Attack[MAX_DRONE_ID+1], Timeout[MAX_DRONE_ID+1];
+
+
+/***************/
+/* Clocks      */
+/***************/
+
+clock h[MAX_DRONE_ID+1];</declaration>
+	<template>
+		<name>Hacker</name>
+		<parameter>int track</parameter>
+		<location id="id0" x="0" y="0">
+			<name x="-17" y="-34">Sniff</name>
+		</location>
+		<init ref="id0"/>
+		<transition>
+			<source ref="id0"/>
+			<target ref="id0"/>
+			<label kind="guard" x="76" y="-34">!channelized_data[track].fault &amp;&amp;
+channelized_data[track].present</label>
+			<label kind="synchronisation" x="76" y="0">Hack[track]!</label>
+			<label kind="assignment" x="76" y="17">channelized_data[track].fault := true</label>
+			<nail x="68" y="34"/>
+			<nail x="68" y="-34"/>
+		</transition>
+	</template>
+	<template>
+		<name x="5" y="5">Network_Track</name>
+		<parameter>int track</parameter>
+		<declaration>clock h;</declaration>
+		<location id="id1" x="-68" y="0">
+			<name x="-93" y="17">Latency</name>
+			<label kind="invariant" x="-127" y="34">h &lt;= MAX_LATENCY</label>
+		</location>
+		<location id="id2" x="-272" y="0">
+			<name x="-289" y="17">Traffic</name>
+			<label kind="invariant" x="-323" y="34">h &lt;= MAX_IDLE</label>
+		</location>
+		<init ref="id2"/>
+		<transition>
+			<source ref="id1"/>
+			<target ref="id1"/>
+			<label kind="synchronisation" x="8" y="-8">Hack[track]?</label>
+			<nail x="0" y="25"/>
+			<nail x="0" y="-25"/>
+		</transition>
+		<transition>
+			<source ref="id2"/>
+			<target ref="id2"/>
+			<label kind="guard" x="-459" y="-17">h == MAX_IDLE</label>
+			<label kind="assignment" x="-391" y="0">h := 0</label>
+			<nail x="-340" y="-25"/>
+			<nail x="-340" y="25"/>
+		</transition>
+		<transition>
+			<source ref="id1"/>
+			<target ref="id2"/>
+			<label kind="synchronisation" x="-255" y="-76">Outputs[track]!</label>
+			<label kind="assignment" x="-136" y="-76">h := 0</label>
+			<nail x="-85" y="-51"/>
+			<nail x="-255" y="-51"/>
+		</transition>
+		<transition>
+			<source ref="id2"/>
+			<target ref="id1"/>
+			<label kind="synchronisation" x="-255" y="-25">Inputs[track]?</label>
+			<label kind="assignment" x="-144" y="-25">h := 0</label>
+		</transition>
+	</template>
+	<template>
+		<name>GCS_Middleware_Tx</name>
+		<declaration>int track;
+
+void send(int track, int rid, int key)
+{
+    channelized_data[track].present := true;
+    channelized_data[track].fault := false;
+    channelized_data[track].key := key; 
+    channelized_data[track].sender := GCS_ID;
+    channelized_data[track].receiver := rid;
+
+    available_tracks--;
+}
+
+</declaration>
+		<location id="id3" x="782" y="136">
+			<urgent/>
+		</location>
+		<location id="id4" x="986" y="136">
+			<committed/>
+		</location>
+		<location id="id5" x="-374" y="-34">
+			<committed/>
+		</location>
+		<location id="id6" x="-170" y="-34">
+			<urgent/>
+		</location>
+		<location id="id7" x="986" y="-34">
+			<committed/>
+		</location>
+		<location id="id8" x="782" y="-34">
+			<urgent/>
+		</location>
+		<location id="id9" x="306" y="-34">
+			<name x="289" y="-93">Post</name>
+		</location>
+		<init ref="id9"/>
+		<transition>
+			<source ref="id4"/>
+			<target ref="id9"/>
+			<label kind="guard" x="340" y="212">track != TRACK_DEFAULT</label>
+			<label kind="synchronisation" x="535" y="212">Inputs[track]!</label>
+			<label kind="assignment" x="340" y="229">send(track, gcs_ftc_did[gcs_mc.value], EXC_Unknown_Position),
+gcs_ftc_did[gcs_mc.value] := DRONE_ID_DEFAULT, gcs_mc.locked := false</label>
+			<nail x="969" y="204"/>
+			<nail x="340" y="204"/>
+		</transition>
+		<transition>
+			<source ref="id9"/>
+			<target ref="id3"/>
+			<label kind="guard" x="340" y="93">gcs_mc.value &lt; MAX_GCS_METHOD_CALLS &amp;&amp;
+to_mw[ENTRIES_FTC_OFFSET+gcs_mc.value]</label>
+			<label kind="synchronisation" x="340" y="153">Unknown_Position[CHANNEL_CALLS_OFFSET+gcs_mc.value]?</label>
+			<label kind="assignment" x="340" y="170">to_mw[ENTRIES_FTC_OFFSET+gcs_mc.value] := false</label>
+			<nail x="340" y="136"/>
+		</transition>
+		<transition>
+			<source ref="id3"/>
+			<target ref="id4"/>
+			<label kind="guard" x="799" y="93">available_tracks &gt; 0</label>
+			<label kind="assignment" x="799" y="110">track := access()</label>
+		</transition>
+		<transition>
+			<source ref="id5"/>
+			<target ref="id9"/>
+			<label kind="guard" x="-340" y="-161">track != TRACK_DEFAULT</label>
+			<label kind="synchronisation" x="-144" y="-161">Inputs[track]!</label>
+			<label kind="assignment" x="-340" y="-144">send(track, gcs_wsc_did[gcs_mc.value], RET_Medical_Supply),
+gcs_wsc_did[gcs_mc.value] := DRONE_ID_DEFAULT, gcs_mc.locked := false</label>
+			<nail x="-357" y="-102"/>
+			<nail x="272" y="-102"/>
+		</transition>
+		<transition>
+			<source ref="id6"/>
+			<target ref="id5"/>
+			<label kind="guard" x="-357" y="-76">available_tracks &gt; 0</label>
+			<label kind="assignment" x="-357" y="-59">track := access()</label>
+		</transition>
+		<transition>
+			<source ref="id9"/>
+			<target ref="id6"/>
+			<label kind="guard" x="-136" y="-76">gcs_mc.value &lt; MAX_GCS_METHOD_CALLS &amp;&amp;
+to_mw[ENTRIES_WSC_OFFSET+gcs_mc.value]</label>
+			<label kind="synchronisation" x="-136" y="-25">Medical_Supply[CHANNEL_CALLS_OFFSET+gcs_mc.value]?</label>
+			<label kind="assignment" x="-136" y="-8">to_mw[ENTRIES_WSC_OFFSET+gcs_mc.value] := false</label>
+		</transition>
+		<transition>
+			<source ref="id7"/>
+			<target ref="id9"/>
+			<label kind="guard" x="340" y="-161">track != TRACK_DEFAULT</label>
+			<label kind="synchronisation" x="535" y="-161">Inputs[track]!</label>
+			<label kind="assignment" x="340" y="-144">send(track, gcs_ftc_did[gcs_mc.value], RET_Next_Position),
+gcs_ftc_did[gcs_mc.value] := DRONE_ID_DEFAULT, gcs_mc.locked := false</label>
+			<nail x="952" y="-102"/>
+			<nail x="340" y="-102"/>
+		</transition>
+		<transition>
+			<source ref="id8"/>
+			<target ref="id7"/>
+			<label kind="guard" x="799" y="-25">available_tracks &gt; 0</label>
+			<label kind="assignment" x="799" y="-8">track := access()</label>
+		</transition>
+		<transition>
+			<source ref="id9"/>
+			<target ref="id8"/>
+			<label kind="guard" x="340" y="-76">gcs_mc.value &lt; MAX_GCS_METHOD_CALLS &amp;&amp;
+to_mw[ENTRIES_FTC_OFFSET+gcs_mc.value]</label>
+			<label kind="synchronisation" x="340" y="-25">Next_Position[CHANNEL_CALLS_OFFSET+gcs_mc.value]?</label>
+			<label kind="assignment" x="340" y="-8">to_mw[ENTRIES_FTC_OFFSET+gcs_mc.value] := false</label>
+		</transition>
+	</template>
+	<template>
+		<name>Drone_Middleware_Tx</name>
+		<parameter>int id</parameter>
+		<declaration>int track;
+
+void send(int track, int key) //We assume that parameters doesn't exeed one parameter ...
+{
+    channelized_data[track].present := true;
+    channelized_data[track].fault := false;
+    channelized_data[track].key := key; 
+    channelized_data[track].sender := id;
+    channelized_data[track].receiver := GCS_ID; 
+
+    available_tracks--;
+}
+
+</declaration>
+		<location id="id10" x="102" y="0">
+			<committed/>
+		</location>
+		<location id="id11" x="-102" y="0">
+			<urgent/>
+		</location>
+		<location id="id12" x="-340" y="0">
+			<name x="-357" y="17">Post</name>
+		</location>
+		<location id="id13" x="-782" y="0">
+			<committed/>
+		</location>
+		<location id="id14" x="-578" y="0">
+			<urgent/>
+		</location>
+		<init ref="id12"/>
+		<transition>
+			<source ref="id10"/>
+			<target ref="id12"/>
+			<label kind="guard" x="-306" y="-76">track != TRACK_DEFAULT</label>
+			<label kind="synchronisation" x="-306" y="-59">Inputs[track]!</label>
+			<label kind="assignment" x="-204" y="-59">send(track, MTH_Fly_To)</label>
+			<nail x="85" y="-34"/>
+			<nail x="-306" y="-34"/>
+		</transition>
+		<transition>
+			<source ref="id11"/>
+			<target ref="id10"/>
+			<label kind="guard" x="-85" y="8">available_tracks &gt; 0</label>
+			<label kind="assignment" x="-85" y="25">track := access()</label>
+		</transition>
+		<transition>
+			<source ref="id12"/>
+			<target ref="id11"/>
+			<label kind="guard" x="-306" y="8">to_mw[id]</label>
+			<label kind="synchronisation" x="-306" y="25">Fly_To[id]?</label>
+			<label kind="assignment" x="-306" y="42">to_mw[id] := false</label>
+		</transition>
+		<transition>
+			<source ref="id13"/>
+			<target ref="id12"/>
+			<label kind="guard" x="-748" y="-76">track != TRACK_DEFAULT</label>
+			<label kind="synchronisation" x="-748" y="-59">Inputs[track]!</label>
+			<label kind="assignment" x="-646" y="-59">send(track, MTH_Which_Supply)</label>
+			<nail x="-765" y="-34"/>
+			<nail x="-374" y="-34"/>
+		</transition>
+		<transition>
+			<source ref="id14"/>
+			<target ref="id13"/>
+			<label kind="guard" x="-765" y="8">available_tracks &gt; 0</label>
+			<label kind="assignment" x="-765" y="25">track := access()</label>
+		</transition>
+		<transition>
+			<source ref="id12"/>
+			<target ref="id14"/>
+			<label kind="guard" x="-553" y="8">to_mw[id]</label>
+			<label kind="synchronisation" x="-553" y="25">Which_Supply[id]?</label>
+			<label kind="assignment" x="-553" y="42">to_mw[id] := false</label>
+		</transition>
+	</template>
+	<template>
+		<name>GCS_Middleware_Rx</name>
+		<declaration>// sq : sniff queue
+
+
+Queue sq := NEW_TRACK_QUEUE;
+
+int receiver := EXCHANGER_DEFAULT;
+int sender := EXCHANGER_DEFAULT;
+int key := MESSAGE_KEY_DEFAULT;
+int ftc := CALL_ID_DEFAULT;
+bool ftce := false;
+int wsc := CALL_ID_DEFAULT;
+bool wsce := false;
+
+
+void listen(int id, int track, Queue &amp;q)
+{   
+    if (channelized_data[track].present &amp;&amp; channelized_data[track].receiver == id)
+    { 
+        enqueue(q,channelized_data[track]);
+
+        channelized_data[track].present := false; 
+        channelized_data[track].fault := false;
+        channelized_data[track].key := MESSAGE_KEY_DEFAULT;
+        channelized_data[track].sender := EXCHANGER_DEFAULT;
+        channelized_data[track].receiver := EXCHANGER_DEFAULT;
+          
+        available_tracks++;
+    }
+}
+
+void reset_locals()
+{
+    receiver := EXCHANGER_DEFAULT;
+    sender := EXCHANGER_DEFAULT;
+    key := MESSAGE_KEY_DEFAULT;
+    ftc := CALL_ID_DEFAULT;
+    ftce := false;
+    wsc := CALL_ID_DEFAULT;
+    wsce := false;
+}
+
+void decode_head(Queue &amp;q)
+{   
+    Message m;
+
+    m := dequeue(q);
+
+    key := m.key;
+    receiver := m.receiver;
+    sender := m.sender;
+            
+    m := DEFAULT_MESSAGE;   
+}
+
+bool a_call_exists_for(int id, int &amp;did[MAX_GCS_METHOD_CALLS])
+{
+    for(i : int[0,MAX_GCS_METHOD_CALLS-1])
+    {
+        if(did[i] == id) return true;
+    }
+    return false;  
+}    
+
+</declaration>
+		<location id="id15" x="-51" y="-442">
+			<committed/>
+		</location>
+		<location id="id16" x="-51" y="-272">
+			<committed/>
+		</location>
+		<location id="id17" x="374" y="-102">
+			<name x="391" y="-111">Delivery</name>
+			<committed/>
+		</location>
+		<location id="id18" x="-476" y="-102">
+			<name x="-510" y="-68">Listen</name>
+		</location>
+		<init ref="id18"/>
+		<transition>
+			<source ref="id15"/>
+			<target ref="id18"/>
+			<label kind="guard" x="-408" y="-331">wsce</label>
+			<label kind="assignment" x="-365" y="-331">reset_locals()</label>
+			<nail x="-68" y="-340"/>
+			<nail x="-408" y="-340"/>
+		</transition>
+		<transition>
+			<source ref="id16"/>
+			<target ref="id18"/>
+			<label kind="guard" x="-408" y="-161">ftce</label>
+			<label kind="assignment" x="-374" y="-161">reset_locals()</label>
+			<nail x="-68" y="-170"/>
+			<nail x="-408" y="-170"/>
+		</transition>
+		<transition>
+			<source ref="id15"/>
+			<target ref="id17"/>
+			<label kind="guard" x="-25" y="-365">wsc == CALL_ID_DEFAULT</label>
+			<nail x="-34" y="-340"/>
+			<nail x="306" y="-340"/>
+		</transition>
+		<transition>
+			<source ref="id16"/>
+			<target ref="id17"/>
+			<label kind="guard" x="-34" y="-161">ftc == CALL_ID_DEFAULT</label>
+			<nail x="-34" y="-170"/>
+			<nail x="306" y="-170"/>
+		</transition>
+		<transition>
+			<source ref="id15"/>
+			<target ref="id18"/>
+			<label kind="guard" x="-408" y="-433">wsc != CALL_ID_DEFAULT &amp;&amp; !wsce</label>
+			<label kind="synchronisation" x="-408" y="-416">Which_Supply[CHANNEL_CALLS_OFFSET+wsc]!</label>
+			<label kind="assignment" x="-408" y="-399">gcs_wsc_did[wsc] := sender, reset_locals()</label>
+			<nail x="-408" y="-442"/>
+		</transition>
+		<transition>
+			<source ref="id16"/>
+			<target ref="id18"/>
+			<label kind="guard" x="-408" y="-263">ftc != CALL_ID_DEFAULT &amp;&amp; !ftce</label>
+			<label kind="synchronisation" x="-408" y="-246">Fly_To[CHANNEL_CALLS_OFFSET+ftc]!</label>
+			<label kind="assignment" x="-408" y="-229">gcs_ftc_did[ftc] := sender, reset_locals()</label>
+			<nail x="-408" y="-272"/>
+		</transition>
+		<transition>
+			<source ref="id17"/>
+			<target ref="id15"/>
+			<label kind="guard" x="-17" y="-467">key == MTH_Which_Supply</label>
+			<label kind="assignment" x="-34" y="-433">wsc := new_call(gcs_wsc_did),
+wsce := a_call_exists_for(sender,gcs_wsc_did),
+from_mw[ENTRIES_WSC_OFFSET+wsc] := true</label>
+			<nail x="306" y="-442"/>
+		</transition>
+		<transition>
+			<source ref="id17"/>
+			<target ref="id16"/>
+			<label kind="guard" x="-17" y="-297">key == MTH_Fly_To</label>
+			<label kind="assignment" x="-34" y="-263">ftc := new_call(gcs_ftc_did),
+ftce := a_call_exists_for(sender,gcs_ftc_did),
+from_mw[ENTRIES_FTC_OFFSET+ftc] := true</label>
+			<nail x="306" y="-272"/>
+		</transition>
+		<transition>
+			<source ref="id18"/>
+			<target ref="id17"/>
+			<label kind="guard" x="-408" y="-93">!(sq.write == sq.read)</label>
+			<label kind="assignment" x="-238" y="-93">decode_head(sq)</label>
+		</transition>
+		<transition>
+			<source ref="id18"/>
+			<target ref="id18"/>
+			<label kind="synchronisation" x="-705" y="-272">Outputs[TRACK_2]?</label>
+			<label kind="assignment" x="-705" y="-255">listen(GCS_ID,TRACK_2,sq)</label>
+			<nail x="-510" y="-238"/>
+			<nail x="-705" y="-238"/>
+			<nail x="-705" y="-85"/>
+			<nail x="-544" y="-85"/>
+		</transition>
+		<transition>
+			<source ref="id18"/>
+			<target ref="id18"/>
+			<label kind="synchronisation" x="-696" y="-221">Outputs[TRACK_1]?</label>
+			<label kind="assignment" x="-696" y="-204">listen(GCS_ID,TRACK_1,sq)</label>
+			<nail x="-510" y="-187"/>
+			<nail x="-696" y="-186"/>
+			<nail x="-696" y="-93"/>
+			<nail x="-544" y="-94"/>
+		</transition>
+		<transition>
+			<source ref="id18"/>
+			<target ref="id18"/>
+			<label kind="synchronisation" x="-688" y="-170">Outputs[TRACK_0]?</label>
+			<label kind="assignment" x="-688" y="-153">listen(GCS_ID,TRACK_0,sq)</label>
+			<nail x="-510" y="-136"/>
+			<nail x="-688" y="-136"/>
+			<nail x="-688" y="-102"/>
+		</transition>
+	</template>
+	<template>
+		<name>Drone_Middleware_Rx</name>
+		<parameter>int id</parameter>
+		<declaration>// sq : sniff queue
+// sqs : sniff queue state
+
+
+Message m := DEFAULT_MESSAGE;
+
+int receiver := EXCHANGER_DEFAULT;
+int sender := EXCHANGER_DEFAULT;
+int key := MESSAGE_KEY_DEFAULT;
+bool fault := false;
+
+
+void listen(int id, int track)
+{   
+    if (channelized_data[track].present &amp;&amp; channelized_data[track].receiver == id)
+    { 
+        m := channelized_data[track];
+
+        channelized_data[track].present := false; 
+        channelized_data[track].fault := false;
+        channelized_data[track].key := MESSAGE_KEY_DEFAULT;
+        channelized_data[track].sender := EXCHANGER_DEFAULT;
+        channelized_data[track].receiver := EXCHANGER_DEFAULT;
+          
+        available_tracks++;
+    }
+}
+
+
+void reset_locals()
+{
+    receiver := EXCHANGER_DEFAULT;
+    sender := EXCHANGER_DEFAULT;    
+    key := MESSAGE_KEY_DEFAULT;
+    m := DEFAULT_MESSAGE;
+}
+
+
+void decode()
+{  
+    key := m.key;
+    receiver := m.receiver;
+    sender := m.sender;
+    fault := m.fault;
+    
+    m := DEFAULT_MESSAGE;
+}
+
+
+
+</declaration>
+		<location id="id19" x="-306" y="-272">
+			<name x="-289" y="-281">Delivery</name>
+			<committed/>
+		</location>
+		<location id="id20" x="-782" y="-272">
+			<name x="-850" y="-255">Listen</name>
+		</location>
+		<init ref="id20"/>
+		<transition>
+			<source ref="id20"/>
+			<target ref="id20"/>
+			<label kind="guard" x="-748" y="-221">h[id] &gt; MAX_WAIT &amp;&amp; m.present</label>
+			<label kind="synchronisation" x="-748" y="-204">Timeout[id]!</label>
+			<label kind="assignment" x="-654" y="-204">reset_locals()</label>
+			<nail x="-748" y="-204"/>
+			<nail x="-816" y="-204"/>
+		</transition>
+		<transition>
+			<source ref="id19"/>
+			<target ref="id20"/>
+			<label kind="guard" x="-740" y="-534">fault</label>
+			<label kind="synchronisation" x="-697" y="-534">Attack[id]!</label>
+			<label kind="assignment" x="-621" y="-534">reset_locals()</label>
+			<nail x="-340" y="-510"/>
+			<nail x="-757" y="-510"/>
+		</transition>
+		<transition>
+			<source ref="id20"/>
+			<target ref="id20"/>
+			<label kind="synchronisation" x="-986" y="-442">Outputs[TRACK_2]?</label>
+			<label kind="assignment" x="-986" y="-425">listen(id,TRACK_2)</label>
+			<nail x="-816" y="-408"/>
+			<nail x="-986" y="-408"/>
+			<nail x="-986" y="-255"/>
+			<nail x="-816" y="-255"/>
+		</transition>
+		<transition>
+			<source ref="id20"/>
+			<target ref="id20"/>
+			<label kind="synchronisation" x="-977" y="-391">Outputs[TRACK_1]?</label>
+			<label kind="assignment" x="-977" y="-374">listen(id,TRACK_1)</label>
+			<nail x="-816" y="-357"/>
+			<nail x="-977" y="-357"/>
+			<nail x="-977" y="-264"/>
+			<nail x="-816" y="-264"/>
+		</transition>
+		<transition>
+			<source ref="id20"/>
+			<target ref="id20"/>
+			<label kind="synchronisation" x="-969" y="-340">Outputs[TRACK_0]?</label>
+			<label kind="assignment" x="-969" y="-323">listen(id,TRACK_0)</label>
+			<nail x="-816" y="-306"/>
+			<nail x="-969" y="-306"/>
+			<nail x="-969" y="-272"/>
+		</transition>
+		<transition>
+			<source ref="id19"/>
+			<target ref="id20"/>
+			<label kind="guard" x="-740" y="-500">!fault &amp;&amp; key == RET_Medical_Supply</label>
+			<label kind="synchronisation" x="-740" y="-466">Medical_Supply[id]!</label>
+			<label kind="assignment" x="-604" y="-466">reset_locals()</label>
+			<nail x="-340" y="-476"/>
+			<nail x="-757" y="-476"/>
+		</transition>
+		<transition>
+			<source ref="id19"/>
+			<target ref="id20"/>
+			<label kind="guard" x="-740" y="-433">!fault &amp;&amp; key == EXC_Unknown_Position</label>
+			<label kind="synchronisation" x="-740" y="-399">Unknown_Position[id]!</label>
+			<label kind="assignment" x="-578" y="-398">reset_locals()</label>
+			<nail x="-340" y="-408"/>
+			<nail x="-757" y="-408"/>
+		</transition>
+		<transition>
+			<source ref="id19"/>
+			<target ref="id20"/>
+			<label kind="guard" x="-740" y="-365">!fault &amp;&amp; key == RET_Next_Position</label>
+			<label kind="synchronisation" x="-740" y="-331">Next_Position[id]!</label>
+			<label kind="assignment" x="-604" y="-331">reset_locals()</label>
+			<nail x="-340" y="-340"/>
+			<nail x="-757" y="-340"/>
+		</transition>
+		<transition>
+			<source ref="id20"/>
+			<target ref="id19"/>
+			<label kind="guard" x="-739" y="-297">h[id] &lt;= MAX_WAIT &amp;&amp; m.present</label>
+			<label kind="assignment" x="-739" y="-272">decode(), from_mw[id] := true</label>
+		</transition>
+	</template>
+	<template>
+		<name>GCS_Mth_Fly_To</name>
+		<parameter>int call</parameter>
+		<location id="id21" x="340" y="-34">
+			<committed/>
+		</location>
+		<location id="id22" x="-51" y="-34">
+			<urgent/>
+		</location>
+		<location id="id23" x="-374" y="-34">
+			<name x="-484" y="-42">Remote_Call</name>
+		</location>
+		<init ref="id23"/>
+		<transition>
+			<source ref="id22"/>
+			<target ref="id21"/>
+			<label kind="guard" x="-25" y="-59">!gcs_mc.locked</label>
+			<label kind="assignment" x="-25" y="-25">from_mw[ENTRIES_FTC_OFFSET+call] := false,
+to_mw[ENTRIES_FTC_OFFSET+call] := true,
+gcs_mc.locked := true, gcs_mc.value := call</label>
+		</transition>
+		<transition>
+			<source ref="id21"/>
+			<target ref="id23"/>
+			<label kind="synchronisation" x="-357" y="42">Unknown_Position[CHANNEL_CALLS_OFFSET+call]!</label>
+			<nail x="323" y="34"/>
+			<nail x="-357" y="34"/>
+		</transition>
+		<transition>
+			<source ref="id21"/>
+			<target ref="id23"/>
+			<label kind="synchronisation" x="-348" y="-127">Next_Position[CHANNEL_CALLS_OFFSET+call]!</label>
+			<nail x="323" y="-102"/>
+			<nail x="-357" y="-102"/>
+		</transition>
+		<transition>
+			<source ref="id23"/>
+			<target ref="id22"/>
+			<label kind="guard" x="-348" y="-59">from_mw[ENTRIES_FTC_OFFSET+call]</label>
+			<label kind="synchronisation" x="-348" y="-25">Fly_To[CHANNEL_CALLS_OFFSET+call]?</label>
+		</transition>
+	</template>
+	<template>
+		<name>GCS_Mth_Which_Supply</name>
+		<parameter>int call</parameter>
+		<location id="id24" x="374" y="-34">
+			<name x="391" y="-42">Return</name>
+			<committed/>
+		</location>
+		<location id="id25" x="0" y="-34">
+			<urgent/>
+		</location>
+		<location id="id26" x="-374" y="-34">
+			<name x="-484" y="-42">Remote_Call</name>
+		</location>
+		<init ref="id26"/>
+		<transition>
+			<source ref="id25"/>
+			<target ref="id24"/>
+			<label kind="guard" x="17" y="-59">!gcs_mc.locked</label>
+			<label kind="assignment" x="17" y="-25">from_mw[ENTRIES_WSC_OFFSET+call] := false,
+to_mw[ENTRIES_WSC_OFFSET+call] := true,
+gcs_mc.locked := true, gcs_mc.value := call</label>
+		</transition>
+		<transition>
+			<source ref="id24"/>
+			<target ref="id26"/>
+			<label kind="synchronisation" x="-357" y="-127">Medical_Supply[CHANNEL_CALLS_OFFSET+call]!</label>
+			<nail x="357" y="-102"/>
+			<nail x="-357" y="-102"/>
+		</transition>
+		<transition>
+			<source ref="id26"/>
+			<target ref="id25"/>
+			<label kind="guard" x="-357" y="-59">from_mw[ENTRIES_WSC_OFFSET+call]</label>
+			<label kind="synchronisation" x="-357" y="-25">Which_Supply[CHANNEL_CALLS_OFFSET+call]?</label>
+		</transition>
+	</template>
+	<template>
+		<name>Drone_Job_Flight</name>
+		<parameter>int id, int period</parameter>
+		<declaration>const int TIMEOUT_DELAY := 1;
+
+// NP,np : Next Position
+// RD : reach dealy
+//upe : unknown position exceptions
+const int MAX_NP_RD            := 160; //
+const int MAX_NP               := 2;
+const int MAX_TIMEOUTS         := 1;
+const int MAX_UPE              := 2;
+
+bool drone_init := false;
+int timeout_count := MAX_TIMEOUTS;
+int np_reach_timer := MAX_NP_RD;
+int np_count := MAX_NP;
+int upe_count := MAX_UPE;
+bool intrusion := false;</declaration>
+		<location id="id27" x="-2312" y="-1326">
+			<name x="-2295" y="-1317">Decision</name>
+			<urgent/>
+		</location>
+		<location id="id28" x="-2312" y="-1496">
+			<name x="-2322" y="-1530">Init</name>
+			<urgent/>
+		</location>
+		<location id="id29" x="-2108" y="-1326">
+			<committed/>
+		</location>
+		<location id="id30" x="-2006" y="-1326">
+			<name x="-2023" y="-1309">Wait</name>
+			<label kind="invariant" x="-2261" y="-1292">h[id] &lt;= MAX_WAIT + TIMEOUT_DELAY</label>
+		</location>
+		<location id="id31" x="-1666" y="-1326">
+			<name x="-1657" y="-1351">Time_In</name>
+			<urgent/>
+		</location>
+		<location id="id32" x="-1666" y="-1598">
+			<name x="-1657" y="-1623">Time_Out</name>
+			<urgent/>
+		</location>
+		<location id="id33" x="-1530" y="-1326">
+			<name x="-1513" y="-1343">Delay</name>
+			<label kind="invariant" x="-1513" y="-1326">h[id] &lt;= period</label>
+		</location>
+		<location id="id34" x="-2108" y="-1190">
+			<name x="-2091" y="-1181">Degraded_Mode</name>
+			<urgent/>
+		</location>
+		<location id="id35" x="-2108" y="-1122">
+			<name x="-2091" y="-1113">Hovering</name>
+			<urgent/>
+		</location>
+		<init ref="id28"/>
+		<transition>
+			<source ref="id32"/>
+			<target ref="id33"/>
+			<nail x="-1564" y="-1598"/>
+		</transition>
+		<transition>
+			<source ref="id31"/>
+			<target ref="id33"/>
+		</transition>
+		<transition>
+			<source ref="id27"/>
+			<target ref="id27"/>
+			<label kind="guard" x="-2533" y="-1385">!intrusion &amp;&amp; 
+np_reach_timer == 0 &amp;&amp; 
+np_count &gt; 0 &amp;&amp; 
+upe_count &gt; 0 &amp;&amp; 
+timeout_count &gt; 0</label>
+			<label kind="assignment" x="-2533" y="-1300">np_reach_timer := MAX_NP_RD, 
+upe_count := MAX_UPE, 
+np_count--</label>
+			<nail x="-2380" y="-1300"/>
+			<nail x="-2380" y="-1351"/>
+		</transition>
+		<transition>
+			<source ref="id28"/>
+			<target ref="id27"/>
+			<label kind="guard" x="-2388" y="-1445">drone_init</label>
+			<label kind="assignment" x="-2388" y="-1428">h[id] := 0</label>
+		</transition>
+		<transition>
+			<source ref="id28"/>
+			<target ref="id28"/>
+			<label kind="guard" x="-2431" y="-1513">!drone_init</label>
+			<label kind="assignment" x="-2482" y="-1496">drone_init := true</label>
+			<nail x="-2346" y="-1479"/>
+			<nail x="-2346" y="-1513"/>
+		</transition>
+		<transition>
+			<source ref="id27"/>
+			<target ref="id29"/>
+			<label kind="guard" x="-2278" y="-1436">!intrusion &amp;&amp; 
+np_reach_timer &gt; 0 &amp;&amp; 
+np_count &gt; 0 &amp;&amp; 
+upe_count &gt; 0 &amp;&amp; 
+timeout_count &gt; 0</label>
+			<label kind="assignment" x="-2278" y="-1351">to_mw[id] := true</label>
+		</transition>
+		<transition>
+			<source ref="id29"/>
+			<target ref="id30"/>
+			<label kind="synchronisation" x="-2091" y="-1351">Fly_To[id]!</label>
+		</transition>
+		<transition>
+			<source ref="id30"/>
+			<target ref="id31"/>
+			<label kind="guard" x="-1963" y="-1360">from_mw[id]</label>
+			<label kind="synchronisation" x="-1963" y="-1343">Next_Position[id]?</label>
+			<label kind="assignment" x="-1963" y="-1317">from_mw[id] := false,
+timeout_count := MAX_TIMEOUTS,
+np_reach_timer := np_reach_timer - period</label>
+		</transition>
+		<transition>
+			<source ref="id30"/>
+			<target ref="id31"/>
+			<label kind="guard" x="-1963" y="-1462">from_mw[id]</label>
+			<label kind="synchronisation" x="-1963" y="-1445">Unknown_Position[id]?</label>
+			<label kind="assignment" x="-1963" y="-1428">from_mw[id] := false,
+timeout_count := MAX_TIMEOUTS,
+upe_count--</label>
+			<nail x="-1972" y="-1428"/>
+			<nail x="-1700" y="-1428"/>
+		</transition>
+		<transition>
+			<source ref="id30"/>
+			<target ref="id31"/>
+			<label kind="guard" x="-1963" y="-1572">from_mw[id]</label>
+			<label kind="synchronisation" x="-1963" y="-1555">Attack[id]?</label>
+			<label kind="assignment" x="-1963" y="-1530">from_mw[id] := false,
+timeout_count := MAX_TIMEOUTS,
+intrusion := true</label>
+			<nail x="-1972" y="-1530"/>
+			<nail x="-1700" y="-1530"/>
+		</transition>
+		<transition>
+			<source ref="id30"/>
+			<target ref="id32"/>
+			<label kind="guard" x="-1963" y="-1649">!from_mw[id]</label>
+			<label kind="synchronisation" x="-1963" y="-1632">Timeout[id]?</label>
+			<label kind="assignment" x="-1963" y="-1615">timeout_count--</label>
+			<nail x="-1972" y="-1598"/>
+		</transition>
+		<transition>
+			<source ref="id33"/>
+			<target ref="id27"/>
+			<label kind="guard" x="-1674" y="-1249">h[id] == period</label>
+			<label kind="assignment" x="-1632" y="-1232">h[id] := 0</label>
+			<nail x="-1564" y="-1258"/>
+			<nail x="-2278" y="-1258"/>
+		</transition>
+		<transition>
+			<source ref="id34"/>
+			<target ref="id33"/>
+			<nail x="-1564" y="-1190"/>
+		</transition>
+		<transition>
+			<source ref="id27"/>
+			<target ref="id34"/>
+			<label kind="guard" x="-2269" y="-1181">intrusion || 
+upe_count == 0 ||
+timeout_count == 0</label>
+			<nail x="-2278" y="-1190"/>
+		</transition>
+		<transition>
+			<source ref="id35"/>
+			<target ref="id33"/>
+			<nail x="-1564" y="-1122"/>
+		</transition>
+		<transition>
+			<source ref="id27"/>
+			<target ref="id35"/>
+			<label kind="guard" x="-2269" y="-1113">!intrusion &amp;&amp; 
+np_count == 0</label>
+			<nail x="-2278" y="-1122"/>
+		</transition>
+	</template>
+	<system>Hacker_0 = Hacker(0);
+Hacker_1 = Hacker(1);
+Hacker_2 = Hacker(2);
+
+Network_Track_0 = Network_Track(0);
+Network_Track_1 = Network_Track(1);
+Network_Track_2 = Network_Track(2);
+
+Drone_Tx_D1 = Drone_Middleware_Tx(1);
+Drone_Tx_D3 = Drone_Middleware_Tx(3);
+Drone_Rx_D1 = Drone_Middleware_Rx(1);
+Drone_Rx_D3 = Drone_Middleware_Rx(3);
+
+
+GCS_Tx = GCS_Middleware_Tx();
+GCS_Rx = GCS_Middleware_Rx();
+GCS_Fly_To_0 = GCS_Mth_Fly_To(0);
+GCS_Fly_To_1 = GCS_Mth_Fly_To(1);
+GCS_Fly_To_2 = GCS_Mth_Fly_To(2);
+GCS_Which_Supply_0 = GCS_Mth_Which_Supply(0);
+GCS_Which_Supply_1 = GCS_Mth_Which_Supply(1);
+GCS_Which_Supply_2 = GCS_Mth_Which_Supply(2);
+
+Drone_Flight_D1 = Drone_Job_Flight(1,80);
+Drone_Flight_D3 = Drone_Job_Flight(3,80);
+
+system Drone_Flight_D1,
+       Drone_Flight_D3,
+
+       GCS_Tx,
+       Drone_Tx_D1,
+       Drone_Tx_D3,
+
+       Network_Track_0,
+       Network_Track_1,        
+       Network_Track_2,
+
+       Hacker_0,
+       Hacker_1,
+       Hacker_2,
+
+       GCS_Rx,
+       Drone_Rx_D1,
+       Drone_Rx_D3,
+
+       GCS_Fly_To_0,
+       GCS_Fly_To_1,
+       GCS_Fly_To_2; 
+       </system>
+	<queries>
+		<query>
+			<formula>A[] not deadlock
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>A[] (Drone_Flight_D1.Time_Out imply h[Drone_Flight_D1.id] &gt; MAX_WAIT)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>A[] (Drone_Flight_D3.Time_Out imply h[Drone_Flight_D3.id] &gt; MAX_WAIT)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>A[] (Drone_Flight_D1.Time_In imply h[Drone_Flight_D1.id] &lt;= MAX_WAIT)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>A[] (Drone_Flight_D3.Time_In imply h[Drone_Flight_D3.id] &lt;= MAX_WAIT)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>A[] (forall (i : int[0,MAX_GCS_METHOD_CALLS-1]) (forall (j : int[0,MAX_GCS_METHOD_CALLS-1]) j != i &amp;&amp; gcs_ftc_did[i] != DRONE_ID_DEFAULT imply gcs_ftc_did[j] != gcs_ftc_did[i]))
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>A&lt;&gt; (Drone_Flight_D1.intrusion || Drone_Flight_D1.timeout_count == 0 || Drone_Flight_D1.upe_count == 0 || (!Drone_Flight_D1.intrusion &amp;&amp; Drone_Flight_D1.np_count == 0))
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>A&lt;&gt; (Drone_Flight_D3.intrusion || Drone_Flight_D3.timeout_count == 0 || Drone_Flight_D3.upe_count == 0 || (!Drone_Flight_D3.intrusion &amp;&amp; Drone_Flight_D3.np_count == 0))
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>E&lt;&gt; (Drone_Flight_D1.timeout_count == 0)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>E&lt;&gt; (Drone_Flight_D3.timeout_count == 0)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>E&lt;&gt; (Drone_Flight_D1.intrusion)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>E&lt;&gt; (Drone_Flight_D3.intrusion)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>E&lt;&gt; (Drone_Flight_D1.upe_count == 0)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>E&lt;&gt; (Drone_Flight_D3.upe_count == 0)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>E&lt;&gt;(!Drone_Flight_D1.intrusion &amp;&amp; Drone_Flight_D1.np_count == 0)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>E&lt;&gt;(!Drone_Flight_D3.intrusion &amp;&amp; Drone_Flight_D3.np_count == 0)
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>(!Drone_Flight_D1.intrusion &amp;&amp; Drone_Flight_D1.np_count == 0) --&gt; Drone_Flight_D1.Hovering
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>(!Drone_Flight_D3.intrusion &amp;&amp; Drone_Flight_D3.np_count == 0) --&gt; Drone_Flight_D3.Hovering
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>(Drone_Flight_D1.intrusion || Drone_Flight_D1.timeout_count == 0 || Drone_Flight_D1.upe_count == 0) --&gt; Drone_Flight_D1.Degraded_Mode
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>(Drone_Flight_D3.intrusion || Drone_Flight_D3.timeout_count == 0 || Drone_Flight_D3.upe_count == 0) --&gt; Drone_Flight_D3.Degraded_Mode
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>Drone_Flight_D1.Decision --&gt; Drone_Flight_D1.Delay
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>Drone_Flight_D3.Decision --&gt; Drone_Flight_D3.Delay
+			</formula>
+			<comment>
+			</comment>
+		</query>
+		<query>
+			<formula>gcs_mc.locked --&gt; !gcs_mc.locked
+			</formula>
+			<comment>
+			</comment>
+		</query>
+	</queries>
+</nta>
